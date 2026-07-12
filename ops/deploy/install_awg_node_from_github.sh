@@ -137,7 +137,11 @@ install_awg_if_needed() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
   grep -qxF 'net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
 
-  if ! command -v awg >/dev/null 2>&1 || ! lsmod | grep -q amneziawg; then
+  log "Installing persistent AmneziaWG DKMS module"
+  download_raw_file "ops/deploy/install_awg_dkms.sh" "/tmp/install-awg-dkms.sh"
+  bash /tmp/install-awg-dkms.sh
+
+  if ! command -v awg >/dev/null 2>&1; then
     log "Installing AmneziaWG prerequisites"
     wait_for_apt_locks
     apt-get install -y software-properties-common unzip git make gcc "linux-headers-$(uname -r)" -qq \

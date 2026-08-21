@@ -9,6 +9,9 @@ NODE_EXPORTER_IMAGE="${NODE_EXPORTER_IMAGE:-prom/node-exporter:v1.8.2}"
 AWG_BOOTSTRAP_RAW_BASE="${AWG_BOOTSTRAP_RAW_BASE:-https://raw.githubusercontent.com/NISIAKAS/awg-node-bootstrap/main}"
 AWG_MASTER_ENROLL_URL="${AWG_MASTER_ENROLL_URL:-}"
 AWG_MASTER_WEBHOOK_URL="${AWG_MASTER_WEBHOOK_URL:-}"
+AWG_TOOLS_URL="${AWG_TOOLS_URL:-https://github.com/amnezia-vpn/amneziawg-tools/releases/download/v1.0.20260223/ubuntu-22.04-amneziawg-tools.zip}"
+AWG_TOOLS_SHA256="${AWG_TOOLS_SHA256:-994289b71dfc8b3392d60f4461a65a869f392653aa5027d217f9519f57340bf0}"
+AWG_TOOLS_COMMIT="${AWG_TOOLS_COMMIT:-5d6179a6d0842e98dfb349c28cf1bd8e4b9d1079}"
 AWG_RUNTIME_ROOT="/opt/awg-node-runtime"
 AWG_RUNTIME_COMPOSE_PATH="${AWG_RUNTIME_ROOT}/docker-compose.node.yml"
 AWG_AGENT_BUILD_DIR="${AWG_RUNTIME_ROOT}/agent-build"
@@ -128,6 +131,39 @@ SERVER_ID=${AWG_SERVER_ID}
 EOF
 }
 
+install_awg_tools_if_needed() {
+  if [[ -x /usr/local/bin/awg && -x /usr/local/bin/awg-quick ]]; then
+    return 0
+  fi
+
+  local archive="/tmp/awg-tools.zip"
+  local extract_dir="/tmp/awg-tools"
+  local binary_dir="${extract_dir}/ubuntu-22.04-amneziawg-tools"
+
+  rm -rf "${archive}" "${extract_dir}"
+  log "Installing pinned AmneziaWG tools"
+  if curl -fsSL "${AWG_TOOLS_URL}" -o "${archive}" \
+    && printf '%s  %s\n' "${AWG_TOOLS_SHA256}" "${archive}" | sha256sum -c - \
+    && unzip -q -o "${archive}" -d "${extract_dir}" \
+    && [[ -f "${binary_dir}/awg" && -f "${binary_dir}/awg-quick" ]]; then
+    install -m 0755 "${binary_dir}/awg" /usr/local/bin/awg
+    install -m 0755 "${binary_dir}/awg-quick" /usr/local/bin/awg-quick
+    test -x /usr/local/bin/awg
+    test -x /usr/local/bin/awg-quick
+    return 0
+  fi
+
+  log "Pinned tools archive unavailable; building tools from pinned source"
+  rm -rf /tmp/awg-tools-src
+  git clone https://github.com/amnezia-vpn/amneziawg-tools.git /tmp/awg-tools-src
+  git -C /tmp/awg-tools-src checkout --detach "${AWG_TOOLS_COMMIT}"
+  make -C /tmp/awg-tools-src/src -j"$(nproc)"
+  install -m 0755 /tmp/awg-tools-src/src/wg /usr/local/bin/awg
+  install -m 0755 /tmp/awg-tools-src/src/wg-quick/linux.bash /usr/local/bin/awg-quick
+  test -x /usr/local/bin/awg
+  test -x /usr/local/bin/awg-quick
+}
+
 install_awg_if_needed() {
   if [[ "${AWG_SERVER_ROLE}" != "exit" ]]; then
     return 0
@@ -140,50 +176,9 @@ install_awg_if_needed() {
   log "Installing persistent AmneziaWG DKMS module"
   download_raw_file "ops/deploy/install_awg_dkms.sh" "/tmp/install-awg-dkms.sh"
   bash /tmp/install-awg-dkms.sh
-
-  if ! command -v awg >/dev/null 2>&1; then
-    log "Installing AmneziaWG prerequisites"
-    wait_for_apt_locks
-    apt-get install -y software-properties-common unzip git make gcc "linux-headers-$(uname -r)" -qq \
-      || apt-get install -y linux-headers-generic unzip git make gcc -qq
-
-    log "Trying AmneziaWG PPA install"
-    wait_for_apt_locks
-    if add-apt-repository -y ppa:amnezia/amneziawg >/dev/null 2>&1 \
-      && apt-get update -qq \
-      && apt-get install -y amneziawg amneziawg-tools -qq; then
-      echo "AWG installed from PPA"
-    else
-      KVER=$(uname -r)
-      KBUILD="/lib/modules/${KVER}/build"
-      if [[ ! -d "${KBUILD}" ]]; then
-        KVER=$(ls /lib/modules/ | sort -V | tail -1)
-        KBUILD="/lib/modules/${KVER}/build"
-      fi
-
-      rm -rf /tmp/awg-src
-      log "Building AmneziaWG kernel module for ${KVER}"
-      git clone --depth=1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git /tmp/awg-src
-      grep -rl timer_delete /tmp/awg-src/src/ | grep -v compat | xargs -r sed -i 's/\btimer_delete\b/del_timer/g'
-      grep -rl timer_delete /tmp/awg-src/src/compat/ | xargs -r sed -i '/timer_delete/d'
-      make -C "${KBUILD}" M=/tmp/awg-src/src modules -j"$(nproc)"
-      make -C "${KBUILD}" M=/tmp/awg-src/src modules_install
-      depmod -a "${KVER}"
-      modprobe amneziawg
-
-      if curl -fsSL https://github.com/amnezia-vpn/amneziawg-tools/releases/download/v1.0.20260223/ubuntu-22.04-amneziawg-tools.zip -o /tmp/awg-tools.zip \
-        && unzip -o /tmp/awg-tools.zip -d /tmp/awg-tools/ \
-        && cp /tmp/awg-tools/ubuntu-22.04-amneziawg-tools/awg /tmp/awg-tools/ubuntu-22.04-amneziawg-tools/awg-quick /usr/local/bin/; then
-        chmod +x /usr/local/bin/awg /usr/local/bin/awg-quick
-      else
-        log "Building AmneziaWG tools from source"
-        rm -rf /tmp/awg-tools-src
-        git clone --depth=1 https://github.com/amnezia-vpn/amneziawg-tools.git /tmp/awg-tools-src
-        make -C /tmp/awg-tools-src/src -j"$(nproc)"
-        make -C /tmp/awg-tools-src/src install
-      fi
-    fi
-  fi
+  modinfo -k "$(uname -r)" amneziawg >/dev/null
+  modprobe amneziawg
+  install_awg_tools_if_needed
 
   if ! systemctl list-unit-files | grep -q 'awg-quick@.service'; then
     cat > /etc/systemd/system/awg-quick@.service <<'EOF'
